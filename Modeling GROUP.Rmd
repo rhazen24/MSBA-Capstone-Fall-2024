@@ -1,0 +1,601 @@
+---
+title: "Modeling Assignment Case Competition"
+author: "RJ Hazen, Marcus Needham, Hunter Nilsen"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Capstone Final Project - Predictive Maintenece: Swire Coca-Cola
+
+## Introduction
+
+For this modeling assignment, we aim to build predictive models to identify key factors driving machine breakdowns within Swire Coca-Cola’s production facilities. Leveraging data from the Internal Warehouse Controller (IWC) system, which monitors machine downtimes, repairs, and maintenance activities across various sites, our goal is to develop models that not only predict the likelihood of future breakdowns but also provide actionable insights to reduce downtime. By analyzing predictive indicators such as average downtime, machine age, and maintenance schedules, this project seeks to enhance operational efficiency and support data-driven decision-making for maintenance management.
+
+### Problem Statement:
+Swire Coca-Cola faces significant losses, around $60 million annually, due to unplanned machine breakdowns. The company wants to reduce these losses by identifying patterns in downtime and developing a predictive maintenance model that can foresee breakdowns before they happen. This would allow the company to better plan for repairs and minimize downtime.
+
+### Objectives:
+The key objectives of this analysis are to:
+
+- Evaluate the predictive accuracy and interpretability of three different models—Random Forest, XGBoost, and Logistic Regression—for forecasting machine breakdowns.
+
+- Identify the specific features each model highlights as important predictors for machine failures, such as average downtime, machine age, and maintenance schedules.
+
+- Compare the effectiveness of each model in differentiating between preventive and unplanned maintenance events and their associated impact on downtime.
+
+- Leverage the insights from these models to inform and optimize a predictive maintenance strategy that minimizes future downtime and improves plant productivity.
+
+## Loading the Necessary Packages
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(caret)
+library(lubridate)
+library(randomForest)
+library(rpart)
+library(dplyr)
+library(zoo)
+library(xgboost)
+library(Matrix)
+``` 
+
+## Loading in the Data
+```{r}
+# Load the dataset
+data <- read.csv("cleaned_IWC_Work_Orders.csv")
+```
+
+# Additional EDA
+
+## Breaking Up Data by Planned and Unplanned
+```{r}
+unplanned_data <- data %>%
+  filter(MAINTENANCE_ACTIVITY_TYPE == "Unplanned")
+
+# Calculate the count of NAs and blanks in each column for these filtered rows
+na_blank_count_by_column_unplanned <- sapply(unplanned_data, function(x) sum(is.na(x) | x == ""))
+
+# Convert to data frame for better readability
+na_blank_count_df_unplanned <- data.frame(Column = names(na_blank_count_by_column_unplanned), NA_Blank_Count = na_blank_count_by_column_unplanned)
+print(na_blank_count_df_unplanned)
+```
+The missing data for unplanned maintenance events, especially in fields like MAINTENANCE_PLAN, MAINTENANCE_ITEM, and equipment details (EQUIP_START_UP_DATE, EQUIP_VALID_FROM, and EQUIP_VALID_TO), suggests that detailed information is often not captured during urgent, unplanned repairs. This lack of detail can limit predictive analyses, as it makes it harder to identify patterns tied to specific equipment, maintenance items, or plant areas.
+
+As a result, predictive maintenance models may have reduced accuracy when trying to forecast unplanned downtimes based on equipment characteristics or maintenance specifics. Addressing these gaps might involve using imputation techniques, focusing on available data for broader trends, or seeking additional data to fill in missing details.
+```{r}
+planned_data <- data %>%
+  filter(MAINTENANCE_ACTIVITY_TYPE == "Planned")
+
+# Calculate the count of NAs and blanks in each column for these filtered rows
+na_blank_count_by_column_planned <- sapply(planned_data, function(x) sum(is.na(x) | x == ""))
+
+# Convert to data frame for better readability
+na_blank_count_df_planned <- data.frame(Column = names(na_blank_count_by_column_planned), NA_Blank_Count = na_blank_count_by_column_planned)
+print(na_blank_count_df_planned)
+```
+For planned maintenance records, most key fields—like identifiers, timestamps, and high-level maintenance descriptions—have no missing data. This makes it easy to analyze the frequency and timing of planned maintenance across different plants and functional areas. However, as we move to more detailed columns, such as specific functional area nodes and equipment lifespan information, missing values start to appear, especially in FUNCTIONAL_AREA_NODE_5_MODIFIED and equipment-related fields like EQUIP_START_UP_DATE.
+
+These gaps in detailed data suggest that certain information, particularly at the component level, may not be consistently captured or is less relevant for planned maintenance activities. While this won’t impact high-level analysis, it could limit deeper insights into specific equipment or component-level maintenance patterns if required for more granular predictive models or lifecycle analyses.
+
+## Downtime Visual
+```{r}
+#Plot the distribution of `ACTUAL_WORK_IN_MINUTES`
+ggplot(data, aes(x = ACTUAL_WORK_IN_MINUTES)) +
+  geom_histogram(binwidth = 10, fill = "blue", color = "black", alpha = 0.7) +
+  scale_x_continuous(limits = c(0, quantile(data$ACTUAL_WORK_IN_MINUTES, 0.99, na.rm = TRUE))) +
+  labs(
+    title = "Distribution of Downtime (ACTUAL_WORK_IN_MINUTES)",
+    x = "Downtime (Minutes)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+#Calculate quantiles of `ACTUAL_WORK_IN_MINUTES`
+quantiles <- quantile(data$ACTUAL_WORK_IN_MINUTES, probs = seq(0, 1, 0.1), na.rm = TRUE)
+print(quantiles)
+
+# Step 3: Determine potential thresholds based on quantiles
+# Let's say we consider downtimes longer than the 75th, 80th, or 90th percentiles as significant
+
+
+# We know the 75th, 80th, and 90th percentiles correspond to indices 8, 9, and 10 respectively
+threshold_options <- c(quantiles[8], quantiles[9], quantiles[10])
+
+
+# Create a summary of downtime events for each threshold
+threshold_summary <- data.frame()
+
+for (threshold in threshold_options) {
+  high_risk_count <- sum(data$ACTUAL_WORK_IN_MINUTES > threshold, na.rm = TRUE)
+  threshold_summary <- rbind(
+    threshold_summary,
+    data.frame(
+      Threshold = threshold,
+      HighRiskCount = high_risk_count,
+      HighRiskPercent = high_risk_count / nrow(data) * 100
+    )
+  )
+}
+
+# Display the summary table
+print(threshold_summary)
+```
+This output provides insights into the duration and frequency of downtime events. The high-risk summary table shows that, depending on the threshold, between 10% and 30% of downtimes are significant enough to potentially impact operations. This information can guide maintenance teams in prioritizing resources to reduce these longer downtime events, as they represent the most impactful delays.
+
+# XGBoost Model
+We will utilize the subset of data where the Maintenance Activity Type is planned to more accurately predict maintenance downtime to create a proactive, data-driven maintenance strategy.
+
+## Step 1: Prepare the Data
+```{r}
+# Filter for planned maintenance only
+planned_data <- data %>% filter(MAINTENANCE_ACTIVITY_TYPE == "Planned")
+```
+
+## Step 2: Data Cleaning
+```{r}
+# Convert date columns to Date format
+planned_data$EQUIP_START_UP_DATE <- as.Date(planned_data$EQUIP_START_UP_DATE, format = "%Y-%m-%d")
+planned_data$EQUIP_VALID_FROM <- as.Date(planned_data$EQUIP_VALID_FROM, format = "%Y-%m-%d")
+planned_data$EXECUTION_START_DATE <- as.Date(planned_data$EXECUTION_START_DATE, format = "%Y-%m-%d")
+
+# Calculate equipment age at the time of maintenance
+planned_data$equipment_age <- as.numeric(difftime(planned_data$EXECUTION_START_DATE, planned_data$EQUIP_START_UP_DATE, units = "days")) / 365.25
+
+# Replace missing values (NA and blanks) in categorical variables with "Unknown"
+planned_data$MAINTENANCE_PLAN[is.na(planned_data$MAINTENANCE_PLAN) | planned_data$MAINTENANCE_PLAN == ""] <- "Unknown"
+planned_data$MAINTENANCE_ITEM[is.na(planned_data$MAINTENANCE_ITEM) | planned_data$MAINTENANCE_ITEM == ""] <- "Unknown"
+planned_data$MAINTENANCE_TYPE_DESCRIPTION[is.na(planned_data$MAINTENANCE_TYPE_DESCRIPTION) | planned_data$MAINTENANCE_TYPE_DESCRIPTION == ""] <- "Unknown"
+
+# Replace missing values in numerical variables with the median
+planned_data$equipment_age[is.na(planned_data$equipment_age) | planned_data$equipment_age == ""] <- median(planned_data$equipment_age, na.rm = TRUE)
+
+# Drop irrelevant or high-missing columns (e.g., identifiers, and columns with over 50% missing data)
+planned_data <- planned_data %>%
+  select(-c(ORDER_ID, EQUIP_VALID_TO, EQUIP_VALID_FROM, EQUIP_START_UP_DATE))
+
+# Encoding categorical variables to numeric for XGBoost
+planned_data$MAINTENANCE_PLAN <- as.numeric(as.factor(planned_data$MAINTENANCE_PLAN))
+planned_data$MAINTENANCE_ITEM <- as.numeric(as.factor(planned_data$MAINTENANCE_ITEM))
+planned_data$MAINTENANCE_TYPE_DESCRIPTION <- as.numeric(as.factor(planned_data$MAINTENANCE_TYPE_DESCRIPTION))
+
+```
+
+## Step 3: Split Data for Modeling
+```{r}
+# planned_data <- planned_data %>%
+#   mutate_if(is.character, as.factor) %>%    # Convert characters to factors
+#   mutate_if(is.factor, as.numeric) 
+# # Split the data into training and testing sets
+# set.seed(123)
+# trainIndex <- createDataPartition(planned_data$ACTUAL_WORK_IN_MINUTES, p = 0.8, list = FALSE)
+# train_data_XG <- planned_data[trainIndex, ]
+# test_data_XG <- planned_data[-trainIndex, ]
+# 
+# # Separate features and target variable
+# train_matrix <- xgb.DMatrix(data = as.matrix(train_data_XG %>% select(-ACTUAL_WORK_IN_MINUTES)), 
+#                             label = train_data_XG$ACTUAL_WORK_IN_MINUTES)
+# test_matrix <- xgb.DMatrix(data = as.matrix(test_data_XG %>% select(-ACTUAL_WORK_IN_MINUTES)), 
+#                            label = test_data_XG$ACTUAL_WORK_IN_MINUTES)
+
+```
+
+## Step 4: Train the Model
+```{r}
+# # Model Training
+# 
+# # Set XGBoost parameters
+# params <- list(
+#   objective = "reg:squarederror",  # for regression
+#   eval_metric = "rmse",            # root mean squared error
+#   max_depth = 6,
+#   eta = 0.1,
+#   subsample = 0.8,
+#   colsample_bytree = 0.8
+# )
+# 
+# # Train the XGBoost model
+# xgb_model <- xgb.train(
+#   params = params,
+#   data = train_matrix,
+#   nrounds = 100,
+#   watchlist = list(train = train_matrix, test = test_matrix),
+#   early_stopping_rounds = 10,    # stop early if no improvement
+#   print_every_n = 10
+# )
+# 
+# # Model Evaluation
+# predictions <- predict(xgb_model, test_matrix)
+# rmse <- sqrt(mean((predictions - test_data$ACTUAL_WORK_IN_MINUTES)^2))
+# print(paste("RMSE on test set:", rmse))
+# 
+# # Feature Importance
+# importance <- xgb.importance(model = xgb_model)
+# xgb.plot.importance(importance)
+```
+The purpose of developing an XGBoost model to predict downtime duration for planned maintenance is to help the maintenance team and production managers at Swire Coca-Cola optimize their maintenance scheduling and resource allocation. By accurately forecasting how long each planned maintenance event will take, the business can make more informed decisions about resource planning, inventory management, and production scheduling, ultimately improving operational efficiency and reducing costs. This model is a work in progress and will fine tune it so we are able to provide an actionable plan come time for the presentation.
+
+
+# Random Forest Model
+## Step 1: Prepare the Data
+```{r}
+# Create data for Random Forest
+rf_data <- data
+
+# View the Data
+str(rf_data)
+head(rf_data)
+
+# Convert empty strings or "NA" strings to true NA values if necessary
+rf_data$EQUIPMENT_ID[rf_data$EQUIPMENT_ID == ""] <- NA
+rf_data$EQUIPMENT_ID[rf_data$EQUIPMENT_ID == "NA"] <- NA
+
+# Remove rows with missing EQUIPMENT_ID if the group decided to do so
+rf_data <- rf_data %>% filter(!is.na(EQUIPMENT_ID))
+head(rf_data)
+
+# Confirm the number of rows after filtering
+print(paste("Number of rows remaining after filtering:", nrow(rf_data)))
+```
+
+## Step 2: Define the Target Variable
+```{r}
+# Define threshold for downtime
+threshold <- 60  # Adjust this as needed
+rf_data$failure_risk <- ifelse(rf_data$ACTUAL_WORK_IN_MINUTES > threshold, 1, 0)
+
+# Randomly sample 100,000 rows if necessary due to memory constraints
+set.seed(123)
+sampled_data <- rf_data[sample(nrow(rf_data), 100000), ]
+
+
+# Convert categorical variables to factors
+sampled_data$PLANT_ID <- as.factor(sampled_data$PLANT_ID)
+sampled_data$MAINTENANCE_ACTIVITY_TYPE <- as.factor(sampled_data$MAINTENANCE_ACTIVITY_TYPE)
+
+# Remove rows with any missing values
+sampled_data <- sampled_data[complete.cases(sampled_data), ]
+
+# Confirm that there are no missing values left
+colSums(is.na(sampled_data))
+```
+
+## Step 4: Split the Data into Training and Test Sets
+```{r}
+set.seed(123)  # For reproducibility
+train_index <- sample(1:nrow(sampled_data), 0.8 * nrow(sampled_data))
+train_data <- sampled_data[train_index, ]
+test_data <- sampled_data[-train_index, ]
+```
+
+## Step 5: Fit the Random Forest Model 
+```{r}
+# Convert the target variable to a factor for classification
+train_data$failure_risk <- as.factor(train_data$failure_risk)
+test_data$failure_risk <- as.factor(test_data$failure_risk)
+
+# Re-run the Random Forest model as a classification model
+rf_model <- randomForest(
+  failure_risk ~ . - ACTUAL_WORK_IN_MINUTES,  # Exclude the original ACTUAL_WORK_IN_MINUTES column
+  data = train_data,
+  ntree = 100,  # Adjust as needed
+  mtry = 3,     # Adjust based on the number of features
+  importance = TRUE
+)
+
+# Print the model summary
+print(rf_model)
+```
+
+## Step 6: Predict and Evaluate the Model
+```{r}
+# Predict on the test set
+rf_predictions <- predict(rf_model, test_data)
+
+# Confusion matrix
+confusionMatrix(rf_predictions, test_data$failure_risk)
+
+# Accuracy
+accuracy <- mean(rf_predictions == test_data$failure_risk)
+print(paste("Test Accuracy:", accuracy))
+```
+
+## Step 7: What makes a machine breakdown?
+```{r}
+# Define breakdown based on a downtime threshold
+threshold <- 60  # Define breakdown as downtimes over 60 minutes
+rf_data$breakdown <- ifelse(rf_data$ACTUAL_WORK_IN_MINUTES > threshold, 1, 0)
+
+# Convert to factor for classification
+rf_data$breakdown <- as.factor(rf_data$breakdown)
+
+# Remove rows with any missing values for simplicity
+sample_data <- rf_data[complete.cases(rf_data), ]
+
+set.seed(123)  # For reproducibility
+train_index <- sample(1:nrow(sample_data), 0.8 * nrow(sample_data))
+train_data <- sample_data[train_index, ]
+test_data <- sample_data[-train_index, ]
+```
+
+## Step 8: Train RF Model
+```{r}
+# Train the Random Forest model
+rf_model <- randomForest(
+  breakdown ~ . - ACTUAL_WORK_IN_MINUTES,  # Exclude downtime as it's the basis for breakdown
+  data = train_data,
+  ntree = 100,
+  mtry = 3,
+  importance = TRUE
+)
+
+# Print the model summary
+print(rf_model)
+
+```
+
+## Step 9: Plot RF Model
+```{r}
+# View and plot feature importance
+importance <- importance(rf_model)
+print(importance)
+
+# Plot feature importance
+varImpPlot(rf_model, main = "Feature Importance for Predicting Machine Breakdowns")
+
+```
+
+Interpretation by Variable
+
+The most influential variable in predicting machine breakdowns is clearly failure_risk, which ranks highest across all metrics, particularly in MeanDecreaseAccuracy (69.70) and MeanDecreaseGini (26408.99). This strong influence suggests that failure risk contains significant information about machine reliability, positioning it as the primary predictor within the model. To further harness its predictive power, it may be beneficial to explore transformations or categorical breakdowns of this feature, potentially enhancing its interpretability and impact in identifying machines at risk of failure.
+
+Other variables such as MAINTENANCE_ITEM and MAINTENANCE_PLAN also play a considerable role, showing high MeanDecreaseGini values (799.15 and 721.23, respectively). This highlights the importance of maintenance details in predicting breakdowns, suggesting that specific maintenance items and plans contribute valuable insight into machine performance. Additionally, EXECUTION_START_DATE and EXECUTION_FINISH_DATE provide moderate predictive value, potentially capturing seasonal or time-based patterns that influence breakdowns. Moderate predictors like ORDER_DESCRIPTION, FUNCTIONAL_LOC, and EQUIPMENT_ID further emphasize the role of equipment-specific characteristics in failure risk. Conversely, low-importance variables such as FUNCTIONAL_AREA_NODE_5_MODIFIED and EQUIP_CAT_DESC exhibit low or negative MeanDecreaseAccuracy scores, indicating limited predictive value and suggesting they may be streamlined out of the model to improve efficiency.
+
+## Binning Failure Risk
+```{r}
+# Check the distribution of `failure_risk` to decide on the quantiles
+summary(train_data$failure_risk)
+
+# Replace NA in numeric columns with the median
+numeric_cols <- sapply(train_data, is.numeric)
+train_data[numeric_cols] <- lapply(train_data[numeric_cols], function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+test_data[numeric_cols] <- lapply(test_data[numeric_cols], function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+
+# Replace NA in categorical columns with "Unknown"
+categorical_cols <- sapply(train_data, is.factor)
+train_data[categorical_cols] <- lapply(train_data[categorical_cols], function(x) ifelse(is.na(x), "Unknown", x))
+test_data[categorical_cols] <- lapply(test_data[categorical_cols], function(x) ifelse(is.na(x), "Unknown", x))
+
+# Define quantile-based cutoffs for high, medium, and low risk
+quantiles <- quantile(train_data$failure_risk, probs = c(0.33, 0.67), na.rm = TRUE)
+
+# Create a new categorical variable based on these quantiles
+train_data <- train_data %>%
+  mutate(failure_risk_category = case_when(
+    failure_risk <= quantiles[1] ~ "Low",
+    failure_risk > quantiles[1] & failure_risk <= quantiles[2] ~ "Medium",
+    failure_risk > quantiles[2] ~ "High"
+  ))
+
+# Convert the new feature to a factor
+train_data$failure_risk_category <- as.factor(train_data$failure_risk_category)
+
+# Repeat for test data, using the same quantiles to ensure consistency
+test_data <- test_data %>%
+  mutate(failure_risk_category = case_when(
+    failure_risk <= quantiles[1] ~ "Low",
+    failure_risk > quantiles[1] & failure_risk <= quantiles[2] ~ "Medium",
+    failure_risk > quantiles[2] ~ "High"
+  ))
+test_data$failure_risk_category <- as.factor(test_data$failure_risk_category)
+
+# Confirm the new categorical distribution
+table(train_data$failure_risk_category)
+
+# Define breakdown variable based on downtime threshold
+threshold <- 60  # Example threshold for a breakdown
+train_data$breakdown <- ifelse(train_data$ACTUAL_WORK_IN_MINUTES > threshold, 1, 0)
+test_data$breakdown <- ifelse(test_data$ACTUAL_WORK_IN_MINUTES > threshold, 1, 0)
+
+# Convert to factor for classification
+train_data$breakdown <- as.factor(train_data$breakdown)
+test_data$breakdown <- as.factor(test_data$breakdown)
+
+# Confirm the breakdown distribution
+table(train_data$breakdown)
+table(test_data$breakdown)
+
+# Load necessary library for rolling calculations
+
+
+# Define the number of recent failures to consider
+n <- 3
+
+# Calculate the average downtime over the last `n` failures for each machine
+train_data <- train_data %>%
+  arrange(EQUIPMENT_ID, EXECUTION_START_DATE) %>%
+  group_by(EQUIPMENT_ID) %>%
+  mutate(avg_downtime_last_n = rollapply(ACTUAL_WORK_IN_MINUTES, width = n, FUN = mean, align = "right", fill = NA))
+
+# Repeat for test data
+test_data <- test_data %>%
+  arrange(EQUIPMENT_ID, EXECUTION_START_DATE) %>%
+  group_by(EQUIPMENT_ID) %>%
+  mutate(avg_downtime_last_n = rollapply(ACTUAL_WORK_IN_MINUTES, width = n, FUN = mean, align = "right", fill = NA))
+
+# Check the new feature
+summary(train_data$avg_downtime_last_n)
+
+```
+
+```{r}
+# Final step: remove any rows with remaining NA values in train and test sets
+train_data <- train_data[complete.cases(train_data), ]
+test_data <- test_data[complete.cases(test_data), ]
+
+# Train the Random Forest model with new features
+rf_model <- randomForest(
+  breakdown ~ . - ACTUAL_WORK_IN_MINUTES - failure_risk,  # Exclude original downtime variable
+  data = train_data,
+  ntree = 100,
+  mtry = 3,
+  importance = TRUE
+)
+
+# View and plot feature importance
+importance <- importance(rf_model)
+print(importance)
+
+# Plot feature importance
+varImpPlot(rf_model, main = "Feature Importance for Predicting Machine Breakdowns")
+```
+
+Most Important Features
+
+The feature avg_downtime_last_n is the most predictive for breakdowns, indicating that machines with higher average downtimes over recent failures are more prone to future breakdowns. This highlights the significance of recent performance history in predicting machine reliability. Additionally, machine_age and EXECUTION_START_DATE demonstrate strong predictive power, suggesting that the likelihood of breakdowns increases with machine age and may be influenced by specific time periods, possibly due to seasonal or operational patterns.
+
+Less Important or Non-Contributing Features
+
+Certain features, such as EQUIPMENT_ID, PLANT_ID, and PRODUCTION_LOCATION, show no predictive contribution, with metrics at zero, indicating they are not valuable in predicting breakdowns within this model. Additionally, failure_risk_category has negative MeanDecreaseAccuracy values, implying it might add noise rather than meaningful information. Moving forward, prioritizing high-value features like avg_downtime_last_n, machine_age, and EXECUTION_START_DATE could enhance predictive accuracy, while eliminating minimal contributors may streamline the model and improve efficiency.
+
+# Logistic Regression Model
+## Step 1: Data Cleaning and Preparation
+```{r}
+# Create data for Logistic Regression
+logistic_data <- data
+
+# Remove rows with missing `EQUIPMENT_ID`
+logistic_data <- logistic_data %>% filter(!is.na(EQUIPMENT_ID))
+
+# Filter the dataset to retain relevant columns only
+logistic_data <- logistic_data %>%
+  select(EQUIPMENT_ID, PLANT_ID, PRODUCTION_LOCATION,
+         MAINTENANCE_ACTIVITY_TYPE, MAINTENANCE_TYPE_DESCRIPTION,
+         ACTUAL_WORK_IN_MINUTES, EXECUTION_START_DATE, EQUIP_START_UP_DATE)
+
+# Ensure date columns are in Date format
+logistic_data <- logistic_data %>%
+  mutate(
+    EXECUTION_START_DATE = as.Date(EXECUTION_START_DATE, format = "%Y-%m-%d"),
+    EQUIP_START_UP_DATE = as.Date(EQUIP_START_UP_DATE, format = "%Y-%m-%d")
+  )
+
+# Calculate machine age if it's a useful feature for maintenance prediction
+logistic_data <- logistic_data %>%
+  mutate(machine_age = as.numeric(difftime(EXECUTION_START_DATE, EQUIP_START_UP_DATE, units = "days")) / 365)
+```
+
+## Step 2: Define the Target Variable
+```{r}
+# Define a threshold (e.g., 60 minutes) for classifying a maintenance event as "high risk"
+threshold <- 60
+logistic_data <- logistic_data %>%
+  mutate(high_risk = ifelse(ACTUAL_WORK_IN_MINUTES > threshold, 1, 0))
+
+# Convert `high_risk` and other categorical variables to factors
+logistic_data <- logistic_data %>%
+  mutate(
+    high_risk = as.factor(high_risk),
+    PLANT_ID = as.factor(PLANT_ID),
+    PRODUCTION_LOCATION = as.factor(PRODUCTION_LOCATION),
+    MAINTENANCE_ACTIVITY_TYPE = as.factor(MAINTENANCE_ACTIVITY_TYPE),
+    MAINTENANCE_TYPE_DESCRIPTION = as.factor(MAINTENANCE_TYPE_DESCRIPTION)
+  )
+```
+
+## Step 3: Sample a subset of the data 
+```{r}
+# Subset of 10,000 rows
+set.seed(123)  # For reproducibility
+logistic_data <- logistic_data[sample(nrow(logistic_data), 10000), ]
+```
+
+## Step 4: Split the Data into Training and Test Sets
+```{r}
+logistic_train_index <- createDataPartition(logistic_data$high_risk, p = 0.8, list = FALSE)
+logistic_train_data <- logistic_data[logistic_train_index, ]
+logistic_test_data <- logistic_data[-logistic_train_index, ]
+
+# Align factor levels between train and test sets for categorical variables
+for (col in c("PLANT_ID", "PRODUCTION_LOCATION", "MAINTENANCE_ACTIVITY_TYPE", "MAINTENANCE_TYPE_DESCRIPTION")) {
+  logistic_test_data[[col]] <- factor(logistic_test_data[[col]], levels = levels(logistic_train_data[[col]]))
+}
+```
+
+## Step 5: Fit the Baseline Logistic Regression Model 
+```{r}
+logit_model <- glm(
+  high_risk ~ . - EQUIPMENT_ID - ACTUAL_WORK_IN_MINUTES - EQUIP_START_UP_DATE - EXECUTION_START_DATE,  # Exclude unneeded columns
+  data = logistic_train_data,
+  family = binomial(link = "logit")
+)
+
+# Summary of the logistic regression model to check coefficients
+summary(logit_model)
+```
+
+The model indicates that machine age is one of the most significant predictor of high-risk machine breakdowns, with a highly significant positive association. This suggests that as machines age, the likelihood of a breakdown increases. However, in this dataset, machine age could only be accurately recorded for planned maintenance activities, limiting its applicability across all machine events. This means that we may not fully capture the impact of machine age on breakdown risk for machines undergoing unplanned maintenance, where age-related degradation is also likely a critical factor.
+
+To enhance the predictive power and reliability of breakdown risk assessments, it would be beneficial to implement more comprehensive methods for tracking machine age across all maintenance activities. This could involve logging machine usage time or operational cycles more consistently, regardless of whether the maintenance is planned or unplanned. By expanding the data on machine age, the model could better identify at-risk machines and support more proactive maintenance scheduling, potentially reducing unexpected downtime and maintenance costs.
+
+## Step 6: Predict and Evaluate the Model
+```{r}
+# Predict probabilities on the test data
+logistic_test_data$predicted_prob <- predict(logit_model, newdata = logistic_test_data, type = "response")
+
+# Convert probabilities to binary predictions based on a threshold (e.g., 0.5)
+logistic_test_data$predicted_class <- ifelse(logistic_test_data$predicted_prob > 0.5, 1, 0)
+
+# Confusion matrix to evaluate performance
+confusionMatrix(as.factor(logistic_test_data$predicted_class), logistic_test_data$high_risk)
+```
+
+The model shows an accuracy of 76.54%, with a high sensitivity (recall for non-breakdowns) of 94.47%, meaning it’s effective at identifying cases where machines do not break down. However, its specificity is low at 27.15%, indicating limited ability to correctly identify actual breakdowns, which results in a high rate of false positives. Additionally, the positive predictive value (precision for non-breakdowns) is 78.13%, suggesting that when the model predicts no breakdown, it’s generally reliable but not highly confident in identifying breakdowns.
+
+The balanced accuracy of 60.81% suggests that, overall, the model has moderate performance but struggles with breakdown prediction. A kappa score of 0.2648 highlights only moderate agreement beyond chance, and McNemar’s test indicates significant imbalance between false positive and false negative rates. To improve, the model could benefit from adjustments to better balance sensitivity and specificity, possibly through threshold tuning or alternative modeling techniques to enhance breakdown detection.
+
+## Next Steps
+
+### 1. Predicting Likelihood of Unplanned Maintenance
+
+A predictive model for estimating the likelihood of unplanned maintenance would provide significant value by helping Swire Coca-Cola reduce unexpected downtime and its associated costs. By identifying equipment with a high probability of unplanned maintenance, the maintenance team can proactively intervene with preventive measures, which minimizes the risk of sudden failures. This approach supports smoother production operations and more predictable workflows, directly addressing the business need to maintain high operational efficiency and reduce costly disruptions in production.
+
+#### Approach
+To build this predictive model, we can use classification techniques such as logistic regression, random forests, or XGBoost. Key features for this model might include:
+- **Machine age**: Age of the equipment at the time of maintenance.
+- **Maintenance frequency**: Number of maintenance events over a specified period.
+- **Historical downtime durations**: The duration of previous downtimes for each piece of equipment.
+
+#### Expected Business Impact
+By predicting the likelihood of unplanned maintenance, the maintenance team can focus preventive efforts on high-risk equipment, thus reducing unexpected downtimes. This would lead to improved production continuity, more predictable maintenance schedules, and a reduction in reactive maintenance costs.
+
+### 2. Clustering Analysis for Maintenance Profiles
+
+Performing a clustering analysis on the maintenance data would enable Swire Coca-Cola to segment equipment based on shared maintenance characteristics, such as downtime duration, maintenance type, and equipment age. This analysis would reveal distinct maintenance profiles, allowing the company to tailor its maintenance strategy for each group. High-risk clusters could be targeted for more frequent preventive maintenance, while low-risk groups could be maintained less often. 
+
+#### Approach
+To identify distinct maintenance profiles, clustering techniques such as K-means or hierarchical clustering could be applied. Key variables for clustering might include:
+- **Downtime duration**: Average or total downtime for each equipment.
+- **Maintenance type**: Types of maintenance actions frequently associated with specific clusters.
+- **Equipment age**: The age or lifecycle stage of the equipment.
+
+#### Expected Business Impact
+This tailored maintenance approach helps optimize resource allocation, reduce unnecessary maintenance costs, and ensure critical assets receive the attention they need. By aligning maintenance frequency with actual risk profiles, this approach addresses the business goal of maximizing operational efficiency and cost-effectiveness in the maintenance process.
+
+
+## Contributions
+
+- Marcus: Random Forest Model and Interpretations
+
+- Hunter: Linear Regression Model and Interpreations
+
+- RJ: Additional EDA and XGBoost Model and Interpretations
+
+

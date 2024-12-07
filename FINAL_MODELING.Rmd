@@ -1,0 +1,250 @@
+---
+title: "MODELING_FINAL"
+author: "RJ Hazen"
+date: "2024-12-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Capstone Final Project - Predictive Maintenece: Swire Coca-Cola
+
+## Introduction
+
+For this modeling assignment, we aim to build predictive models to identify key factors driving machine breakdowns within Swire Coca-Cola’s production facilities. Leveraging data from the Internal Warehouse Controller (IWC) system, which monitors machine downtimes, repairs, and maintenance activities across various sites, our goal is to develop models that not only predict the likelihood of future breakdowns but also provide actionable insights to reduce downtime. By analyzing predictive indicators such as average downtime, machine age, and maintenance schedules, this project seeks to enhance operational efficiency and support data-driven decision-making for maintenance management.
+
+### Problem Statement:
+Swire Coca-Cola faces significant losses, around $60 million annually, due to unplanned machine breakdowns. The company wants to reduce these losses by identifying patterns in downtime and developing a predictive maintenance model that can foresee breakdowns before they happen. This would allow the company to better plan for repairs and minimize downtime.
+
+### Objectives:
+The key objectives of this analysis are to:
+
+- Evaluate the predictive accuracy and interpretability of three different models—Random Forest, XGBoost, and Logistic Regression—for forecasting machine breakdowns.
+
+- Identify the specific features each model highlights as important predictors for machine failures, such as average downtime, machine age, and maintenance schedules.
+
+- Compare the effectiveness of each model in differentiating between preventive and unplanned maintenance events and their associated impact on downtime.
+
+- Leverage the insights from these models to inform and optimize a predictive maintenance strategy that minimizes future downtime and improves plant productivity.
+
+## Loading the Necessary Packages
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(caret)
+library(lubridate)
+library(randomForest)
+library(rpart)
+library(dplyr)
+library(zoo)
+library(xgboost)
+library(Matrix)
+``` 
+
+## Loading in the Data
+```{r}
+# Load the dataset
+data <- read.csv("cleaned_IWC_Work_Orders.csv")
+```
+
+# Additional EDA
+
+## Breaking Up Data by Planned and Unplanned
+```{r}
+unplanned_data <- data %>%
+  filter(MAINTENANCE_ACTIVITY_TYPE == "Unplanned")
+
+# Calculate the count of NAs and blanks in each column for these filtered rows
+na_blank_count_by_column_unplanned <- sapply(unplanned_data, function(x) sum(is.na(x) | x == ""))
+
+# Convert to data frame for better readability
+na_blank_count_df_unplanned <- data.frame(Column = names(na_blank_count_by_column_unplanned), NA_Blank_Count = na_blank_count_by_column_unplanned)
+print(na_blank_count_df_unplanned)
+```
+
+The missing data for unplanned maintenance events, especially in fields like MAINTENANCE_PLAN, MAINTENANCE_ITEM, and equipment details (EQUIP_START_UP_DATE, EQUIP_VALID_FROM, and EQUIP_VALID_TO), suggests that detailed information is often not captured during urgent, unplanned repairs. This lack of detail can limit predictive analyses, as it makes it harder to identify patterns tied to specific equipment, maintenance items, or plant areas.
+
+As a result, predictive maintenance models may have reduced accuracy when trying to forecast unplanned downtimes based on equipment characteristics or maintenance specifics. Addressing these gaps might involve using imputation techniques, focusing on available data for broader trends, or seeking additional data to fill in missing details.
+```{r}
+planned_data <- data %>%
+  filter(MAINTENANCE_ACTIVITY_TYPE == "Planned")
+
+# Calculate the count of NAs and blanks in each column for these filtered rows
+na_blank_count_by_column_planned <- sapply(planned_data, function(x) sum(is.na(x) | x == ""))
+
+# Convert to data frame for better readability
+na_blank_count_df_planned <- data.frame(Column = names(na_blank_count_by_column_planned), NA_Blank_Count = na_blank_count_by_column_planned)
+print(na_blank_count_df_planned)
+```
+
+For planned maintenance records, most key fields—like identifiers, timestamps, and high-level maintenance descriptions—have no missing data. This makes it easy to analyze the frequency and timing of planned maintenance across different plants and functional areas. However, as we move to more detailed columns, such as specific functional area nodes and equipment lifespan information, missing values start to appear, especially in FUNCTIONAL_AREA_NODE_5_MODIFIED and equipment-related fields like EQUIP_START_UP_DATE.
+
+These gaps in detailed data suggest that certain information, particularly at the component level, may not be consistently captured or is less relevant for planned maintenance activities. While this won’t impact high-level analysis, it could limit deeper insights into specific equipment or component-level maintenance patterns if required for more granular predictive models or lifecycle analyses.
+
+## Downtime Visual
+```{r}
+#Plot the distribution of `ACTUAL_WORK_IN_MINUTES`
+ggplot(data, aes(x = ACTUAL_WORK_IN_MINUTES)) +
+  geom_histogram(binwidth = 10, fill = "blue", color = "black", alpha = 0.7) +
+  scale_x_continuous(limits = c(0, quantile(data$ACTUAL_WORK_IN_MINUTES, 0.99, na.rm = TRUE))) +
+  labs(
+    title = "Distribution of Downtime (ACTUAL_WORK_IN_MINUTES)",
+    x = "Downtime (Minutes)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+#Calculate quantiles of `ACTUAL_WORK_IN_MINUTES`
+quantiles <- quantile(data$ACTUAL_WORK_IN_MINUTES, probs = seq(0, 1, 0.1), na.rm = TRUE)
+print(quantiles)
+
+# Step 3: Determine potential thresholds based on quantiles
+# Let's say we consider downtimes longer than the 75th, 80th, or 90th percentiles as significant
+
+
+# We know the 75th, 80th, and 90th percentiles correspond to indices 8, 9, and 10 respectively
+threshold_options <- c(quantiles[8], quantiles[9], quantiles[10])
+
+
+# Create a summary of downtime events for each threshold
+threshold_summary <- data.frame()
+
+for (threshold in threshold_options) {
+  high_risk_count <- sum(data$ACTUAL_WORK_IN_MINUTES > threshold, na.rm = TRUE)
+  threshold_summary <- rbind(
+    threshold_summary,
+    data.frame(
+      Threshold = threshold,
+      HighRiskCount = high_risk_count,
+      HighRiskPercent = high_risk_count / nrow(data) * 100
+    )
+  )
+}
+
+# Display the summary table
+print(threshold_summary)
+```
+
+This output provides insights into the duration and frequency of downtime events. The high-risk summary table shows that, depending on the threshold, between 10% and 30% of downtimes are significant enough to potentially impact operations. This information can guide maintenance teams in prioritizing resources to reduce these longer downtime events, as they represent the most impactful delays.
+
+# XGBoost Model
+We will utilize the subset of data where the Maintenance Activity Type is planned to more accurately predict maintenance downtime to create a proactive, data-driven maintenance strategy.
+
+## Step 1: Prepare the Data
+```{r}
+# Filter for planned maintenance only
+planned_data <- data %>% filter(MAINTENANCE_ACTIVITY_TYPE == "Planned")
+```
+
+## Step 2: Data Cleaning
+```{r}
+# Convert date columns to Date format
+planned_data$EQUIP_START_UP_DATE <- as.Date(planned_data$EQUIP_START_UP_DATE, format = "%Y-%m-%d")
+planned_data$EQUIP_VALID_FROM <- as.Date(planned_data$EQUIP_VALID_FROM, format = "%Y-%m-%d")
+planned_data$EXECUTION_START_DATE <- as.Date(planned_data$EXECUTION_START_DATE, format = "%Y-%m-%d")
+
+# Calculate equipment age at the time of maintenance
+planned_data$equipment_age <- as.numeric(difftime(planned_data$EXECUTION_START_DATE, planned_data$EQUIP_START_UP_DATE, units = "days")) / 365.25
+
+# Replace missing values (NA and blanks) in categorical variables with "Unknown"
+planned_data$MAINTENANCE_PLAN[is.na(planned_data$MAINTENANCE_PLAN) | planned_data$MAINTENANCE_PLAN == ""] <- "Unknown"
+planned_data$MAINTENANCE_ITEM[is.na(planned_data$MAINTENANCE_ITEM) | planned_data$MAINTENANCE_ITEM == ""] <- "Unknown"
+planned_data$MAINTENANCE_TYPE_DESCRIPTION[is.na(planned_data$MAINTENANCE_TYPE_DESCRIPTION) | planned_data$MAINTENANCE_TYPE_DESCRIPTION == ""] <- "Unknown"
+
+# Replace missing values in numerical variables with the median
+planned_data$equipment_age[is.na(planned_data$equipment_age) | planned_data$equipment_age == ""] <- median(planned_data$equipment_age, na.rm = TRUE)
+
+# Drop irrelevant or high-missing columns (e.g., identifiers, and columns with over 50% missing data)
+planned_data <- planned_data %>%
+  select(-c(ORDER_ID, EQUIP_VALID_TO, EQUIP_VALID_FROM, EQUIP_START_UP_DATE))
+
+# Encoding categorical variables to numeric for XGBoost
+planned_data$MAINTENANCE_PLAN <- as.numeric(as.factor(planned_data$MAINTENANCE_PLAN))
+planned_data$MAINTENANCE_ITEM <- as.numeric(as.factor(planned_data$MAINTENANCE_ITEM))
+planned_data$MAINTENANCE_TYPE_DESCRIPTION <- as.numeric(as.factor(planned_data$MAINTENANCE_TYPE_DESCRIPTION))
+
+```
+
+## Step 3: Split Data for Modeling
+```{r}
+ planned_data <- planned_data %>%
+   mutate_if(is.character, as.factor) %>%    # Convert characters to factors
+   mutate_if(is.factor, as.numeric) 
+ # Split the data into training and testing sets
+ set.seed(123)
+ trainIndex <- createDataPartition(planned_data$ACTUAL_WORK_IN_MINUTES, p = 0.8, list = FALSE)
+ train_data_XG <- planned_data[trainIndex, ]
+ test_data_XG <- planned_data[-trainIndex, ]
+ 
+ # Separate features and target variable
+ train_matrix <- xgb.DMatrix(data = as.matrix(train_data_XG %>% select(-ACTUAL_WORK_IN_MINUTES)), 
+                             label = train_data_XG$ACTUAL_WORK_IN_MINUTES)
+# test_matrix <- xgb.DMatrix(data = as.matrix(test_data_XG %>% select(-ACTUAL_WORK_IN_MINUTES)), 
+#                            label = test_data_XG$ACTUAL_WORK_IN_MINUTES)
+
+```
+
+## Step 4: Train the Model
+```{r}
+# # Model Training
+# 
+# # Set XGBoost parameters
+# params <- list(
+#   objective = "reg:squarederror",  # for regression
+#   eval_metric = "rmse",            # root mean squared error
+#   max_depth = 6,
+#   eta = 0.1,
+#   subsample = 0.8,
+#   colsample_bytree = 0.8
+# )
+# 
+# # Train the XGBoost model
+# xgb_model <- xgb.train(
+#   params = params,
+#   data = train_matrix,
+#   nrounds = 100,
+#   watchlist = list(train = train_matrix, test = test_matrix),
+#   early_stopping_rounds = 10,    # stop early if no improvement
+#   print_every_n = 10
+# )
+# 
+# # Model Evaluation
+# predictions <- predict(xgb_model, test_matrix)
+# rmse <- sqrt(mean((predictions - test_data$ACTUAL_WORK_IN_MINUTES)^2))
+# print(paste("RMSE on test set:", rmse))
+# 
+# # Feature Importance
+# importance <- xgb.importance(model = xgb_model)
+# xgb.plot.importance(importance)
+```
+The purpose of developing an XGBoost model to predict downtime duration for planned maintenance is to help the maintenance team and production managers at Swire Coca-Cola optimize their maintenance scheduling and resource allocation. By accurately forecasting how long each planned maintenance event will take, the business can make more informed decisions about resource planning, inventory management, and production scheduling, ultimately improving operational efficiency and reducing costs. This model is a work in progress and will fine tune it so we are able to provide an actionable plan come time for the presentation.
+
+## Next Steps
+
+### 1. Predicting Likelihood of Unplanned Maintenance
+
+A predictive model for estimating the likelihood of unplanned maintenance would provide significant value by helping Swire Coca-Cola reduce unexpected downtime and its associated costs. By identifying equipment with a high probability of unplanned maintenance, the maintenance team can proactively intervene with preventive measures, which minimizes the risk of sudden failures. This approach supports smoother production operations and more predictable workflows, directly addressing the business need to maintain high operational efficiency and reduce costly disruptions in production.
+
+#### Approach
+To build this predictive model, we can use classification techniques such as logistic regression, random forests, or XGBoost. Key features for this model might include:
+- **Machine age**: Age of the equipment at the time of maintenance.
+- **Maintenance frequency**: Number of maintenance events over a specified period.
+- **Historical downtime durations**: The duration of previous downtimes for each piece of equipment.
+
+#### Expected Business Impact
+By predicting the likelihood of unplanned maintenance, the maintenance team can focus preventive efforts on high-risk equipment, thus reducing unexpected downtimes. This would lead to improved production continuity, more predictable maintenance schedules, and a reduction in reactive maintenance costs.
+
+### 2. Clustering Analysis for Maintenance Profiles
+
+Performing a clustering analysis on the maintenance data would enable Swire Coca-Cola to segment equipment based on shared maintenance characteristics, such as downtime duration, maintenance type, and equipment age. This analysis would reveal distinct maintenance profiles, allowing the company to tailor its maintenance strategy for each group. High-risk clusters could be targeted for more frequent preventive maintenance, while low-risk groups could be maintained less often. 
+
+#### Approach
+To identify distinct maintenance profiles, clustering techniques such as K-means or hierarchical clustering could be applied. Key variables for clustering might include:
+- **Downtime duration**: Average or total downtime for each equipment.
+- **Maintenance type**: Types of maintenance actions frequently associated with specific clusters.
+- **Equipment age**: The age or lifecycle stage of the equipment.
+
+#### Expected Business Impact
+This tailored maintenance approach helps optimize resource allocation, reduce unnecessary maintenance costs, and ensure critical assets receive the attention they need. By aligning maintenance frequency with actual risk profiles, this approach addresses the business goal of maximizing operational efficiency and cost-effectiveness in the maintenance process.
